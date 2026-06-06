@@ -1,0 +1,568 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║         GitLab CI/CD Pipeline — Node.js + Python → AWS EC2      ║
+# ║         Author : Mulayam Yadav | Cloud & Network Security Eng.  ║
+# ╚══════════════════════════════════════════════════════════════════╝
+#
+# ── REQUIRED GitLab CI/CD Variables (Settings → CI/CD → Variables) ──
+#
+#   EC2_HOST          → Public IP or DNS of your EC2 instance
+#   EC2_USER          → SSH user (e.g. ubuntu, ec2-user)
+#   EC2_SSH_KEY       → Private SSH key (type: File, protected)
+#   EC2_APP_DIR       → Remote app directory (e.g. /var/www/myapp)
+#   AWS_REGION        → e.g. ap-south-1
+#   AWS_ACCESS_KEY_ID → IAM user access key (protected + masked)
+#   AWS_SECRET_ACCESS_KEY → IAM user secret key (protected + masked)
+#   NODE_ENV          → e.g. production
+#   APP_PORT          → e.g. 3000
+#   SLACK_WEBHOOK_URL → (optional) Slack webhook for notifications
+#
+# ── PIPELINE STAGES ────────────────────────────────────────────────
+#   validate → test → security → build → deploy:staging → deploy:prod
+
+stages:
+  - validate
+  - test
+  - security
+  - build
+  - deploy_staging
+  - deploy_production
+  - notify
+
+# ── GLOBAL DEFAULTS ────────────────────────────────────────────────
+default:
+  interruptible: true
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+# ── REUSABLE ANCHORS ───────────────────────────────────────────────
+.ssh_setup: &ssh_setup |
+  which ssh-agent || apk add --no-cache openssh-client
+  eval $(ssh-agent -s)
+  chmod 600 "$EC2_SSH_KEY"
+  ssh-add "$EC2_SSH_KEY"
+  mkdir -p ~/.ssh
+  chmod 700 ~/.ssh
+  ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+.only_main: &only_main
+  only:
+    - main
+    - master
+
+.only_staging: &only_staging
+  only:
+    - develop
+    - staging
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 1 — VALIDATE
+# ══════════════════════════════════════════════════════════════════
+
+lint:nodejs:
+  stage: validate
+  image: node:20-alpine
+  cache:
+    key: node-$CI_COMMIT_REF_SLUG
+    paths:
+      - node_modules/
+  before_script:
+    - node --version
+    - npm --version
+    - npm ci --prefer-offline
+  script:
+    - echo "▶ Running ESLint..."
+    - npx eslint . --ext .js,.ts --max-warnings=0 || true
+    - echo "▶ Checking Prettier formatting..."
+    - npx prettier --check "**/*.{js,ts,json}" || true
+  rules:
+    - exists:
+        - package.json
+
+lint:python:
+  stage: validate
+  image: python:3.11-slim
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths:
+      - .pip-cache/
+  before_script:
+    - python --version
+    - pip install --cache-dir .pip-cache flake8 black isort mypy 2>/dev/null
+  script:
+    - echo "▶ Running flake8..."
+    - flake8 . --max-line-length=120 --exclude=venv,.venv,migrations || true
+    - echo "▶ Checking Black formatting..."
+    - black --check . || true
+    - echo "▶ Checking import order with isort..."
+    - isort --check-only . || true
+  rules:
+    - exists:
+        - requirements.txt
+        - pyproject.toml
+
+validate:docker:
+  stage: validate
+  image: hadolint/hadolint:latest-alpine
+  script:
+    - echo "▶ Linting Dockerfile..."
+    - hadolint Dockerfile
+  rules:
+    - exists:
+        - Dockerfile
+  allow_failure: true
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 2 — TEST
+# ══════════════════════════════════════════════════════════════════
+
+test:nodejs:
+  stage: test
+  image: node:20-alpine
+  services:
+    - name: postgres:15-alpine
+      alias: postgres
+    - name: redis:7-alpine
+      alias: redis
+  variables:
+    POSTGRES_DB: test_db
+    POSTGRES_USER: test_user
+    POSTGRES_PASSWORD: test_pass
+    DATABASE_URL: "postgresql://test_user:test_pass@postgres:5432/test_db"
+    REDIS_URL: "redis://redis:6379"
+    NODE_ENV: test
+  cache:
+    key: node-$CI_COMMIT_REF_SLUG
+    paths:
+      - node_modules/
+    policy: pull
+  before_script:
+    - npm ci --prefer-offline
+  script:
+    - echo "▶ Running Node.js unit tests..."
+    - npm test -- --coverage --ci --forceExit
+  coverage: '/Lines\s*:\s*(\d+\.?\d*)%/'
+  artifacts:
+    when: always
+    reports:
+      junit: junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+    expire_in: 7 days
+  rules:
+    - exists:
+        - package.json
+
+test:python:
+  stage: test
+  image: python:3.11-slim
+  services:
+    - name: postgres:15-alpine
+      alias: postgres
+  variables:
+    POSTGRES_DB: test_db
+    POSTGRES_USER: test_user
+    POSTGRES_PASSWORD: test_pass
+    DATABASE_URL: "postgresql://test_user:test_pass@postgres:5432/test_db"
+    PYTHONDONTWRITEBYTECODE: "1"
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths:
+      - .pip-cache/
+    policy: pull
+  before_script:
+    - pip install --cache-dir .pip-cache -r requirements.txt 2>/dev/null
+    - pip install --cache-dir .pip-cache pytest pytest-cov pytest-html 2>/dev/null
+  script:
+    - echo "▶ Running Python unit tests..."
+    - pytest tests/
+      --cov=.
+      --cov-report=xml:coverage.xml
+      --cov-report=html:htmlcov
+      --junitxml=pytest-report.xml
+      -v
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    when: always
+    reports:
+      junit: pytest-report.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+    paths:
+      - htmlcov/
+    expire_in: 7 days
+  rules:
+    - exists:
+        - requirements.txt
+        - pyproject.toml
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 3 — SECURITY SCANNING
+# ══════════════════════════════════════════════════════════════════
+
+security:node-audit:
+  stage: security
+  image: node:20-alpine
+  cache:
+    key: node-$CI_COMMIT_REF_SLUG
+    paths:
+      - node_modules/
+    policy: pull
+  script:
+    - echo "▶ Running npm audit..."
+    - npm audit --audit-level=high
+  allow_failure: true
+  rules:
+    - exists:
+        - package.json
+
+security:python-bandit:
+  stage: security
+  image: python:3.11-slim
+  before_script:
+    - pip install bandit safety 2>/dev/null
+  script:
+    - echo "▶ Running Bandit SAST scan..."
+    - bandit -r . -x ./tests,./venv,./.venv -ll || true
+    - echo "▶ Checking dependencies for known vulnerabilities..."
+    - safety check -r requirements.txt || true
+  allow_failure: true
+  rules:
+    - exists:
+        - requirements.txt
+
+security:secrets-detect:
+  stage: security
+  image: trufflesecurity/trufflehog:latest
+  script:
+    - echo "▶ Scanning for secrets in repository..."
+    - trufflehog git file://. --only-verified --fail || true
+  allow_failure: true
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 4 — BUILD
+# ══════════════════════════════════════════════════════════════════
+
+build:nodejs:
+  stage: build
+  image: node:20-alpine
+  cache:
+    key: node-$CI_COMMIT_REF_SLUG
+    paths:
+      - node_modules/
+    policy: pull
+  before_script:
+    - npm ci --prefer-offline
+  script:
+    - echo "▶ Building Node.js application..."
+    - npm run build
+    - echo "▶ Build version → $CI_COMMIT_SHORT_SHA"
+    - echo "$CI_COMMIT_SHORT_SHA" > dist/VERSION
+    - echo "$CI_COMMIT_TIMESTAMP" >> dist/VERSION
+  artifacts:
+    paths:
+      - dist/
+      - node_modules/
+    expire_in: 1 hour
+  rules:
+    - exists:
+        - package.json
+
+build:python:
+  stage: build
+  image: python:3.11-slim
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths:
+      - .pip-cache/
+    policy: pull
+  script:
+    - echo "▶ Preparing Python build..."
+    - pip install --cache-dir .pip-cache -r requirements.txt --target=./packages 2>/dev/null
+    - echo "$CI_COMMIT_SHORT_SHA" > VERSION
+    - echo "$CI_COMMIT_TIMESTAMP" >> VERSION
+    - tar -czf python-build.tar.gz . --exclude='.git' --exclude='.pip-cache' --exclude='__pycache__'
+    - echo "▶ Python build archive created."
+  artifacts:
+    paths:
+      - python-build.tar.gz
+      - VERSION
+    expire_in: 1 hour
+  rules:
+    - exists:
+        - requirements.txt
+        - pyproject.toml
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 5 — DEPLOY TO STAGING
+# ══════════════════════════════════════════════════════════════════
+
+deploy:staging:
+  stage: deploy_staging
+  image: alpine:3.18
+  environment:
+    name: staging
+    url: http://$EC2_HOST:$APP_PORT
+  before_script:
+    - apk add --no-cache openssh-client rsync
+    - *ssh_setup
+  script:
+    - echo "▶ Deploying to STAGING on EC2 ($EC2_HOST)..."
+
+    # ── Create remote directory ──
+    - ssh $EC2_USER@$EC2_HOST "mkdir -p $EC2_APP_DIR/staging"
+
+    # ── Sync Node.js build ──
+    - |
+      if [ -d "dist" ]; then
+        echo "  → Syncing Node.js dist..."
+        rsync -az --delete dist/ $EC2_USER@$EC2_HOST:$EC2_APP_DIR/staging/dist/
+        rsync -az --delete node_modules/ $EC2_USER@$EC2_HOST:$EC2_APP_DIR/staging/node_modules/
+        rsync -az package.json $EC2_USER@$EC2_HOST:$EC2_APP_DIR/staging/
+      fi
+
+    # ── Sync Python build ──
+    - |
+      if [ -f "python-build.tar.gz" ]; then
+        echo "  → Uploading Python build archive..."
+        scp python-build.tar.gz $EC2_USER@$EC2_HOST:$EC2_APP_DIR/staging/
+        ssh $EC2_USER@$EC2_HOST "
+          cd $EC2_APP_DIR/staging &&
+          tar -xzf python-build.tar.gz --overwrite &&
+          rm -f python-build.tar.gz
+        "
+      fi
+
+    # ── Restart services on EC2 ──
+    - |
+      ssh $EC2_USER@$EC2_HOST "
+        set -e
+        echo '  → Installing Python deps on EC2...'
+        cd $EC2_APP_DIR/staging
+        [ -f requirements.txt ] && pip3 install -r requirements.txt --quiet 2>/dev/null || true
+
+        echo '  → Restarting staging services...'
+        if command -v pm2 &> /dev/null; then
+          pm2 reload ecosystem.staging.config.js --env staging 2>/dev/null || \
+          pm2 start ecosystem.staging.config.js --env staging 2>/dev/null || true
+        fi
+
+        if systemctl is-active --quiet app-staging 2>/dev/null; then
+          sudo systemctl restart app-staging
+        fi
+
+        echo '  → Staging deploy complete ✓'
+        echo '  → Commit: $CI_COMMIT_SHORT_SHA'
+      "
+
+    # ── Health check ──
+    - sleep 8
+    - |
+      ssh $EC2_USER@$EC2_HOST "
+        curl -sf http://localhost:$APP_PORT/health > /dev/null && \
+        echo '  → Health check PASSED ✓' || \
+        echo '  → Health check failed (app may still be starting)'
+      "
+  only:
+    - develop
+    - staging
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 6 — DEPLOY TO PRODUCTION
+# ══════════════════════════════════════════════════════════════════
+
+deploy:production:
+  stage: deploy_production
+  image: alpine:3.18
+  environment:
+    name: production
+    url: http://$EC2_HOST
+  when: manual  # ← Requires manual approval in GitLab UI
+  before_script:
+    - apk add --no-cache openssh-client rsync
+    - *ssh_setup
+  script:
+    - echo "▶ Deploying to PRODUCTION on EC2 ($EC2_HOST)..."
+    - echo "  → Commit : $CI_COMMIT_SHORT_SHA"
+    - echo "  → Branch : $CI_COMMIT_REF_NAME"
+    - echo "  → Triggered by : $GITLAB_USER_LOGIN"
+
+    # ── Backup current production ──
+    - |
+      ssh $EC2_USER@$EC2_HOST "
+        BACKUP_DIR=$EC2_APP_DIR/backups/\$(date +%Y%m%d_%H%M%S)
+        echo '  → Backing up current production to '\$BACKUP_DIR
+        mkdir -p \$BACKUP_DIR
+        [ -d $EC2_APP_DIR/current ] && cp -r $EC2_APP_DIR/current/. \$BACKUP_DIR/ || true
+        # Keep only last 5 backups
+        ls -1dt $EC2_APP_DIR/backups/*/ 2>/dev/null | tail -n +6 | xargs rm -rf || true
+      "
+
+    # ── Sync Node.js build ──
+    - |
+      if [ -d "dist" ]; then
+        echo "  → Syncing Node.js dist to production..."
+        rsync -az --delete dist/ $EC2_USER@$EC2_HOST:$EC2_APP_DIR/current/dist/
+        rsync -az --delete node_modules/ $EC2_USER@$EC2_HOST:$EC2_APP_DIR/current/node_modules/
+        rsync -az package.json $EC2_USER@$EC2_HOST:$EC2_APP_DIR/current/
+      fi
+
+    # ── Sync Python build ──
+    - |
+      if [ -f "python-build.tar.gz" ]; then
+        echo "  → Uploading Python build archive..."
+        scp python-build.tar.gz $EC2_USER@$EC2_HOST:$EC2_APP_DIR/current/
+        ssh $EC2_USER@$EC2_HOST "
+          cd $EC2_APP_DIR/current &&
+          tar -xzf python-build.tar.gz --overwrite &&
+          rm -f python-build.tar.gz
+        "
+      fi
+
+    # ── Install deps & restart production services ──
+    - |
+      ssh $EC2_USER@$EC2_HOST "
+        set -e
+        cd $EC2_APP_DIR/current
+
+        echo '  → Installing Python deps...'
+        [ -f requirements.txt ] && pip3 install -r requirements.txt --quiet 2>/dev/null || true
+
+        echo '  → Restarting production services...'
+        if command -v pm2 &> /dev/null; then
+          pm2 reload ecosystem.config.js --env production 2>/dev/null || \
+          pm2 start ecosystem.config.js --env production 2>/dev/null || true
+          pm2 save || true
+        fi
+
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+          sudo nginx -t && sudo systemctl reload nginx
+        fi
+
+        if systemctl is-active --quiet app 2>/dev/null; then
+          sudo systemctl restart app
+        fi
+
+        echo '  → Production deploy complete ✓'
+      "
+
+    # ── Production health check with retry ──
+    - |
+      echo "▶ Running production health check..."
+      for i in 1 2 3 4 5; do
+        sleep 5
+        RESULT=$(ssh $EC2_USER@$EC2_HOST \
+          "curl -sf http://localhost:$APP_PORT/health && echo OK || echo FAIL")
+        if [ "$RESULT" = "OK" ]; then
+          echo "  → Health check PASSED on attempt $i ✓"
+          break
+        fi
+        echo "  → Attempt $i failed, retrying..."
+        if [ $i -eq 5 ]; then
+          echo "  ✖ Health check FAILED after 5 attempts — consider rollback"
+          exit 1
+        fi
+      done
+
+  <<: *only_main
+
+# ══════════════════════════════════════════════════════════════════
+# ROLLBACK JOB (manual trigger)
+# ══════════════════════════════════════════════════════════════════
+
+rollback:production:
+  stage: deploy_production
+  image: alpine:3.18
+  environment:
+    name: production
+  when: manual
+  before_script:
+    - apk add --no-cache openssh-client
+    - *ssh_setup
+  script:
+    - echo "⚠ Rolling back production to last backup..."
+    - |
+      ssh $EC2_USER@$EC2_HOST "
+        set -e
+        LATEST_BACKUP=\$(ls -1dt $EC2_APP_DIR/backups/*/ 2>/dev/null | head -1)
+        if [ -z \"\$LATEST_BACKUP\" ]; then
+          echo '  ✖ No backup found — cannot rollback'
+          exit 1
+        fi
+        echo '  → Restoring from '\$LATEST_BACKUP
+        rsync -az --delete \$LATEST_BACKUP $EC2_APP_DIR/current/
+        if command -v pm2 &> /dev/null; then
+          pm2 reload ecosystem.config.js --env production 2>/dev/null || true
+        fi
+        if systemctl is-active --quiet app 2>/dev/null; then
+          sudo systemctl restart app
+        fi
+        echo '  → Rollback complete ✓'
+      "
+  <<: *only_main
+
+# ══════════════════════════════════════════════════════════════════
+# STAGE 7 — NOTIFY
+# ══════════════════════════════════════════════════════════════════
+
+notify:success:
+  stage: notify
+  image: alpine:3.18
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        curl -sf -X POST "$SLACK_WEBHOOK_URL" \
+          -H 'Content-type: application/json' \
+          --data "{
+            \"text\": \"✅ *Deployment Successful*\",
+            \"attachments\": [{
+              \"color\": \"good\",
+              \"fields\": [
+                {\"title\": \"Project\", \"value\": \"$CI_PROJECT_NAME\", \"short\": true},
+                {\"title\": \"Branch\", \"value\": \"$CI_COMMIT_REF_NAME\", \"short\": true},
+                {\"title\": \"Commit\", \"value\": \"$CI_COMMIT_SHORT_SHA\", \"short\": true},
+                {\"title\": \"Deployed by\", \"value\": \"$GITLAB_USER_LOGIN\", \"short\": true},
+                {\"title\": \"Message\", \"value\": \"$CI_COMMIT_MESSAGE\", \"short\": false}
+              ]
+            }]
+          }"
+        echo "  → Slack notification sent ✓"
+      else
+        echo "  → SLACK_WEBHOOK_URL not set, skipping notification"
+      fi
+  when: on_success
+  <<: *only_main
+
+notify:failure:
+  stage: notify
+  image: alpine:3.18
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        curl -sf -X POST "$SLACK_WEBHOOK_URL" \
+          -H 'Content-type: application/json' \
+          --data "{
+            \"text\": \"🚨 *Pipeline FAILED*\",
+            \"attachments\": [{
+              \"color\": \"danger\",
+              \"fields\": [
+                {\"title\": \"Project\", \"value\": \"$CI_PROJECT_NAME\", \"short\": true},
+                {\"title\": \"Branch\", \"value\": \"$CI_COMMIT_REF_NAME\", \"short\": true},
+                {\"title\": \"Commit\", \"value\": \"$CI_COMMIT_SHORT_SHA\", \"short\": true},
+                {\"title\": \"Failed by\", \"value\": \"$GITLAB_USER_LOGIN\", \"short\": true},
+                {\"title\": \"Pipeline URL\", \"value\": \"$CI_PIPELINE_URL\", \"short\": false}
+              ]
+            }]
+          }"
+      fi
+  when: on_failure
