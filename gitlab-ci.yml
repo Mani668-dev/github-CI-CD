@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║         GitLab CI/CD Pipeline — Node.js + Python → AWS EC2      ║
-# ║         Author : Mulayam Yadav | Cloud & Network Security Eng.  ║
+# ║         Author : MAnikanta | Devops Engineer ║
 # ╚══════════════════════════════════════════════════════════════════╝
 #
 # ── REQUIRED GitLab CI/CD Variables (Settings → CI/CD → Variables) ──
